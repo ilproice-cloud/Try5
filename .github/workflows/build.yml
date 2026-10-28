@@ -1,5 +1,5 @@
 
-name: Build RealmForge
+name: RealmForge Fabric 1.21.1 Build
 
 on:
   workflow_dispatch:
@@ -17,121 +17,135 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 21
+      - name: Install Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Extract RealmForge ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ZIP_FILE="$(find . -maxdepth 1 -type f \
-            -iname 'RealmForge*.zip' \
-            ! -iname '*Workflow*' -print -quit)"
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: RealmForge ZIP not found in repository root."
-            exit 1
-          fi
-
-          mkdir -p extracted
-          unzip -q "$ZIP_FILE" -d extracted
-
-          BUILD_FILE="$(find extracted -type f \
-            -name build.gradle -print -quit)"
-
-          if [ -z "$BUILD_FILE" ]; then
-            echo "ERROR: build.gradle not found inside ZIP."
-            exit 1
-          fi
-
-          PROJECT_DIR="$(dirname "$BUILD_FILE")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      - name: Fix Gradle repository conflict
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          p = Path("settings.gradle")
-          if not p.exists():
-              raise SystemExit("ERROR: settings.gradle not found")
-
-          s = p.read_text()
-
-          # Remove dependencyResolutionManagement block,
-          # including nested braces.
-          match = re.search(
-              r'\bdependencyResolutionManagement\s*\{',
-              s
-          )
-
-          if match:
-              start = match.start()
-              brace = s.find("{", match.start())
-              depth = 0
-              end = None
-
-              for i in range(brace, len(s)):
-                  if s[i] == "{":
-                      depth += 1
-                  elif s[i] == "}":
-                      depth -= 1
-                      if depth == 0:
-                          end = i + 1
-                          break
-
-              if end is None:
-                  raise SystemExit(
-                      "ERROR: Could not parse repository block"
-                  )
-
-              s = s[:start] + s[end:]
-
-          p.write_text(s)
-          print("Updated settings.gradle")
-          PY
-
-          echo "---- settings.gradle ----"
-          cat settings.gradle
-
-      - name: Set up Gradle
+      - name: Install Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: Build mod
+      - name: Extract the correct RealmForge ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="RealmForge-Fabric-1.21.1-Compile-Fix.zip"
+
+          if [ ! -f "$ZIP" ]; then
+            echo "ERROR: Upload $ZIP to the repository root."
+            echo "Available ZIP files:"
+            find . -maxdepth 2 -type f -iname '*.zip'
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/realmforge"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/realmforge"
+
+          BUILD_FILE="$(find "$RUNNER_TEMP/realmforge" \
+            -type f -name build.gradle -print -quit)"
+
+          if [ -z "$BUILD_FILE" ]; then
+            echo "ERROR: build.gradle not found in ZIP."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$(dirname "$BUILD_FILE")" >> "$GITHUB_ENV"
+
+      - name: Fix known source and repository errors
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - "$PROJECT_DIR" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+
+          # Remove repository policy that conflicts with Fabric Loom.
+          settings = root / "settings.gradle"
+          if settings.exists():
+              text = settings.read_text()
+              match = re.search(
+                  r'(?m)^\s*dependencyResolutionManagement\s*\{',
+                  text
+              )
+
+              if match:
+                  start = match.start()
+                  brace = text.find("{", match.start())
+                  depth = 0
+                  end = None
+
+                  for i in range(brace, len(text)):
+                      if text[i] == "{":
+                          depth += 1
+                      elif text[i] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              end = i + 1
+                              break
+
+                  if end is None:
+                      raise SystemExit(
+                          "Could not safely remove repository block"
+                      )
+
+                  text = text[:start] + text[end:]
+                  settings.write_text(text)
+
+          # Fix the reported double-to-int compilation error.
+          found = False
+          for source in root.rglob("*.java"):
+              text = source.read_text()
+              updated = text.replace(
+                  "int gearHp = gearBonus(",
+                  "double gearHp = gearBonus("
+              )
+              if updated != text:
+                  source.write_text(updated)
+                  found = True
+                  print("Fixed:", source)
+
+          if not found:
+              print("gearHp declaration already fixed or absent")
+
+          print("Pre-build corrections complete")
+          PY
+
+      - name: Compile RealmForge
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
           gradle --no-daemon clean build
 
-      - name: Collect compiled JAR
+      - name: Verify and collect mod JAR
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p "$GITHUB_WORKSPACE/dist"
 
           find "$PROJECT_DIR/build/libs" \
             -maxdepth 1 -type f -name '*.jar' \
             ! -name '*-sources.jar' \
-            -exec cp {} dist/ \;
+            -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
 
-          if ! find dist -name '*.jar' -print -quit | grep -q .; then
-            echo "ERROR: No compiled JAR was produced."
+          if ! find "$GITHUB_WORKSPACE/dist" \
+            -maxdepth 1 -type f -name '*.jar' \
+            | grep -q .; then
+            echo "ERROR: No mod JAR produced."
             exit 1
           fi
 
-      - name: Upload JAR
+          ls -lh "$GITHUB_WORKSPACE/dist"
+
+      - name: Upload compiled JAR
         uses: actions/upload-artifact@v4
         with:
           name: RealmForge-Fabric-1.21.1-JAR
